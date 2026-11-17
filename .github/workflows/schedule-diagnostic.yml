@@ -1,0 +1,25 @@
+name: Schedule diagnostic
+
+on:
+  push:
+    paths:
+      - '.github/workflows/schedule-diagnostic.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '1-59/5 * * * *'
+
+permissions: {}
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record trigger
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+        run: |
+          echo "Event: $TRIGGER_EVENT"
+          date -u
+          echo "Event: $TRIGGER_EVENT" >> "$GITHUB_STEP_SUMMARY"
+          date -u >> "$GITHUB_STEP_SUMMARY"
