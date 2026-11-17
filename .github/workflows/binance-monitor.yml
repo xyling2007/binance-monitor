@@ -1,0 +1,184 @@
+name: Binance Discord Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2-59/5 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: binance-monitor-state
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check trades and send Discord notifications
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          const ID = '5075281354358777856';
+          const DAY = 86400000;
+          const PAGE = `https://www.binance.bh/zh-TC/copy-trading/lead-details/${ID}`;
+          const API = 'https://www.binance.bh/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/order-history';
+          
+          export function validate(body) {
+            const d = body?.data;
+            if (body?.code !== '000000' || !Array.isArray(d?.list) || !Number.isInteger(d.total) || d.total < d.list.length) {
+              throw new Error('幣安回應格式或狀態異常，未更新交易基準');
+            }
+            for (const r of d.list) {
+              if (!r.symbol || !['BUY', 'SELL'].includes(r.side) || !['LONG', 'SHORT', 'BOTH'].includes(r.positionSide) ||
+                  !Number.isFinite(r.orderTime) || !Number.isFinite(r.orderUpdateTime) ||
+                  !Number.isFinite(Number(r.executedQty)) || !Number.isFinite(Number(r.avgPrice))) {
+                throw new Error('交易欄位異常，未更新交易基準');
+              }
+            }
+            return d;
+          }
+          
+          export async function loadOrders(now, fetcher = fetch) {
+            let calls = 0;
+            async function window(startTime, endTime) {
+              if (++calls > 25) throw new Error('紀錄過多，超出單次讀取上限；需調整分頁方案');
+              const res = await fetcher(API, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ portfolioId: ID, startTime, endTime, pageSize: 100 }),
+                signal: AbortSignal.timeout(15000), redirect: 'manual'
+              });
+              if (!res.ok) throw new Error(`幣安 HTTP ${res.status}，未更新交易基準`);
+              let body;
+              try { body = await res.json(); } catch { throw new Error('幣安未回傳 JSON，可能需要登入或遭限制'); }
+              const d = validate(body);
+              if (d.total > d.list.length) {
+                if (startTime >= endTime) throw new Error('同一毫秒紀錄超過上限，無法完整讀取');
+                const mid = Math.floor((startTime + endTime) / 2);
+                return [...await window(startTime, mid), ...await window(mid + 1, endTime)];
+              }
+              if (d.list.some(r => r.orderTime < startTime || r.orderTime > endTime)) {
+                throw new Error('介面未遵守查詢時間範圍，需重新確認參數');
+              }
+              return d.list;
+            }
+            return window(now - 7 * DAY, now);
+          }
+          
+          // No order ID is exposed. Count identical rows separately to preserve identical fills.
+          export function events(rows) {
+            const counts = new Map();
+            return [...rows].sort((a, b) => a.orderTime - b.orderTime).map(r => {
+              const key = JSON.stringify([r.symbol, r.side, r.positionSide, r.orderTime,
+                r.orderUpdateTime, String(r.executedQty), String(r.avgPrice), String(r.totalPnl)]);
+              const n = (counts.get(key) || 0) + 1;
+              counts.set(key, n);
+              return { key: `${key}#${n}`, time: r.orderTime, row: r };
+            });
+          }
+          
+          export function message(r) {
+            const action = r.positionSide === 'LONG' ? (r.side === 'BUY' ? '開多／加多' : '平多／減多') :
+              r.positionSide === 'SHORT' ? (r.side === 'SELL' ? '開空／加空' : '平空／減空') : r.side;
+            const time = new Date(r.orderTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+            return `【幣安最新紀錄】${action}\n${r.symbol}｜數量 ${r.executedQty}\n均價 ${r.avgPrice} ${r.quoteAsset || 'USDT'}\n已實現盈虧 ${r.totalPnl ?? '未提供'}\n交易時間（台北）：${time}\n${PAGE}`;
+          }
+          
+          async function notify(env, content) {
+            const url = new URL(env.DISCORD_WEBHOOK_URL);
+            if (url.hostname !== 'discord.com' || !url.pathname.startsWith('/api/webhooks/')) throw new Error('Discord Webhook 設定錯誤');
+            url.searchParams.set('wait', 'true');
+            const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ content: content.slice(0, 1950), allowed_mentions: { parse: [] } }),
+              signal: AbortSignal.timeout(15000), redirect: 'manual' });
+            if (!r.ok) throw new Error(`Discord HTTP ${r.status}`);
+          }
+          
+          export async function run(env) {
+            const now = Date.now();
+            let state = await env.MONITOR_KV.get('state', 'json') || { seen: {}, failures: 0 };
+            const save = () => env.MONITOR_KV.put('state', JSON.stringify(state));
+            try {
+              const current = events(await loadOrders(now));
+              if (!state.initialized) {
+                await notify(env, `監控啟動成功：每五分鐘檢查。已建立 ${current.length} 筆歷史紀錄基準，舊紀錄不逐筆通知。\n${PAGE}`);
+                state.seen = Object.fromEntries(current.map(e => [e.key, e.time]));
+                state.initialized = true;
+              } else {
+                if (now - state.lastSuccess > 7 * DAY) {
+                  await notify(env, '⚠️ 監控中斷超過七天，七天以前的交易無法補查。');
+                }
+                for (const event of current.filter(e => !(e.key in state.seen))) {
+                  await notify(env, message(event.row));
+                  state.seen[event.key] = event.time;
+                  await save(); // Persist only confirmed deliveries; a crash can still cause a duplicate.
+                }
+                if (state.failures >= 3) await notify(env, '✅ 幣安監控已恢復，已補查最近七天紀錄。');
+              }
+              state.seen = Object.fromEntries(Object.entries(state.seen).filter(([, t]) => t >= now - 8 * DAY));
+              state.lastSuccess = now;
+              state.lastError = null;
+              state.failures = 0;
+            } catch (error) {
+              state.failures = (state.failures || 0) + 1;
+              state.lastError = String(error.message).slice(0, 250);
+              console.error(state.lastError);
+              if (state.failures === 3 || (state.failures > 3 && state.failures % 72 === 0)) {
+                try { await notify(env, `⚠️ 監控連續失敗 ${state.failures} 次\n${state.lastError}\n此期間無法確認是否有新交易，系統會於下次排程重試。`); }
+                catch { console.error('Discord 警告無法送達，請檢查 Cloudflare logs'); }
+              }
+            }
+            state.lastCheck = now;
+            await save();
+          }
+          
+          
+          import { existsSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
+          if (!process.env.DISCORD_WEBHOOK_URL) throw new Error('Missing DISCORD_WEBHOOK_URL repository secret');
+          const statePath = '.monitor-state.json';
+          const env = {
+            DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
+            MONITOR_KV: {
+              async get() { return existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : null; },
+              async put(key, value) {
+                writeFileSync(statePath + '.tmp', value);
+                renameSync(statePath + '.tmp', statePath);
+              }
+            }
+          };
+          await run(env);
+          const state = JSON.parse(readFileSync(statePath, 'utf8'));
+          const summary = `# Binance monitor\n\nChecked: ${new Date(state.lastCheck).toISOString()}\n\n` +
+            `Initialized: ${!!state.initialized}\n\nConsecutive failures: ${state.failures}\n\n` +
+            (state.failures ? 'FAILED. See job logs.\n' : 'Data check and required Discord deliveries succeeded.\n');
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          if (state.failures) process.exitCode = 1;
+          JS
+      - name: Save notification state
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          if [ ! -f .monitor-state.json ]; then
+            echo 'No state to save; check the preceding step.'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- .monitor-state.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update monitor notification state [skip ci]'
+            git pull --rebase
+            git push
+          fi
+
