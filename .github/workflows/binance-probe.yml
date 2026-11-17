@@ -1,0 +1,58 @@
+name: Test Binance connection
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Test anonymous Binance API access
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const now = Date.now();
+          const payload = {
+            portfolioId: '5075281354358777856',
+            startTime: now - 7 * 86400000,
+            endTime: now,
+            pageSize: 100
+          };
+          const summaries = ['# Binance connection test', '', `UTC: ${new Date(now).toISOString()}`, ''];
+          let passed = false;
+          for (const host of ['www.binance.bh', 'www.binance.com']) {
+            try {
+              const response = await fetch(`https://${host}/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/order-history`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify(payload),
+                redirect: 'manual',
+                signal: AbortSignal.timeout(20000)
+              });
+              const text = await response.text();
+              let body;
+              try { body = JSON.parse(text); } catch {}
+              const data = body?.data;
+              const success = response.ok && body?.code === '000000' &&
+                Array.isArray(data?.list) && Number.isInteger(data.total);
+              passed ||= success;
+              const result = `${host}: ${success ? 'PASS' : 'FAIL'} | HTTP ${response.status}` +
+                ` | API code: ${String(body?.code ?? 'not JSON').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 50)}` +
+                (success ? ` | returned: ${data.list.length} | total: ${data.total}` : '');
+              console.log(result);
+              summaries.push(`- ${result}`);
+            } catch (error) {
+              const result = `${host}: FAIL | network/timeout error (${error.name})`;
+              console.log(result);
+              summaries.push(`- ${result}`);
+            }
+          }
+          summaries.push('', passed ? 'At least one endpoint is reachable. Monitoring is not installed yet.' :
+            'Neither endpoint is reachable. Do not set up scheduled monitoring here yet.');
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaries.join('\n') + '\n');
+          if (!passed) process.exitCode = 1;
+          JS
